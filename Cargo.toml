@@ -6,17 +6,14 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.100"
 argh = "0.1.13"
+base64 = "0.22.1"
 hayagriva = "0.9.1"
 jotdown = "0.8.1"
 latex2mathml = "0.2.3"
 serde = { version = "1.0.228", features = ["serde_derive"] }
 serde_json = "1.0.145"
+sha2 = "0.10.9"
 syntect = "5.3.0"
-tera = { version = "1.20.0", default-features = false, features = [
-    "humansize",
-    "rand",
-    "slug",
-    "urlencode",
-] }
+tera = "1.20.0"
 tracing = "0.1.41"
 tracing-subscriber = "0.3.20"

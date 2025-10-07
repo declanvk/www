@@ -1,0 +1,24 @@
+:root {
+    color-scheme: light dark;
+
+    --berkeley-blue: hsla(212, 90%, 20%, 1);
+    --indigo-dye: hsla(198, 100%, 23%, 1);
+    --jungle-green: hsla(164, 93%, 34%, 1);
+    --citron: hsla(50, 52%, 66%, 1);
+    --gamboge: hsla(40, 94%, 49%, 1);
+}
+
+body {
+    max-width: min(80svw, 800px);
+    margin: 0px auto;
+}
+
+.draft {
+    background-image: url("data:image/svg+xml;charset=UTF-8,%3csvg width='150' height='50' viewBox='0 0 50 50' fill='none' xmlns='http://www.w3.org/2000/svg'%3e%3ctext x='30' y='40' fill='red'%3eDRAFT%3c/text%3e%3c/svg%3e ");
+    background-attachment: fixed;
+    background-repeat: repeat-y;
+}
+
+.debug {
+    background-color: red;
+}

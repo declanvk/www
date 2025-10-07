@@ -1,8 +1,8 @@
-use std::path::PathBuf;
-
 use anyhow::Context;
 use argh::FromArgs;
-use tracing::{debug, info};
+use tracing::debug;
+
+use crate::build::BuildCmd;
 
 mod build;
 
@@ -21,19 +21,6 @@ struct Cli {
 #[argh(subcommand)]
 enum SubCommand {
     Build(BuildCmd),
-}
-
-#[derive(FromArgs, Debug)]
-/// Build the static site.
-#[argh(subcommand, name = "build")]
-struct BuildCmd {
-    /// path to the input directory
-    #[argh(positional)]
-    input_path: PathBuf,
-
-    /// path to the output directory
-    #[argh(positional)]
-    output_path: PathBuf,
 }
 
 fn main() -> anyhow::Result<()> {
