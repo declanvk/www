@@ -1,9 +1,11 @@
 use std::{
-    any::{Any, TypeId},
-    collections::{BTreeMap, HashMap},
+    cmp,
+    collections::BTreeMap,
     ffi::{OsStr, OsString},
+    fmt,
     fs::{self, DirEntry},
     io,
+    ops::{Index, IndexMut},
     path::{Path, PathBuf},
     process::Command,
 };
@@ -38,11 +40,7 @@ impl BuildCmd {
     }
 
     fn output_folder(&self, content_slug: &ContentSlug) -> PathBuf {
-        let Some(slug_parent) = content_slug.0.parent() else {
-            return self.output_path.clone();
-        };
-
-        self.output_path.join(slug_parent)
+        self.output_path.join(&content_slug.parent)
     }
 }
 
@@ -105,16 +103,117 @@ impl BuildDirFiles {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
-#[repr(transparent)]
-struct ContentSlug(PathBuf);
+#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
+enum ContentSlugStem {
+    Index,
+    Other(OsString),
+}
 
-#[derive(Debug)]
-struct Content {
-    files: BTreeMap<ContentSlug, ContentFile>,
+impl Ord for ContentSlugStem {
+    // This implementation is important because it means that all "index.<ext>"
+    // files will be ordered after non-"index" files. Since the "index" will
+    // normally contain a list of entries, this is helpful so all the file's
+    // metadata and other info will already be present.
+    fn cmp(&self, other: &Self) -> cmp::Ordering {
+        match (self, other) {
+            (Self::Index, Self::Index) => cmp::Ordering::Equal,
+            (Self::Other(this), Self::Other(other)) => this.cmp(other),
+            (Self::Index, Self::Other(_)) => cmp::Ordering::Greater,
+            (Self::Other(_), Self::Index) => cmp::Ordering::Less,
+        }
+    }
+}
+
+impl PartialOrd for ContentSlugStem {
+    fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+struct ContentSlug {
+    parent: PathBuf,
+    stem: ContentSlugStem,
+    extension: Option<OsString>,
+}
+
+impl Serialize for ContentSlug {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.to_string().serialize(serializer)
+    }
+}
+
+impl fmt::Display for ContentSlug {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.as_path().display().fmt(f)
+    }
+}
+
+impl ContentSlug {
+    fn from_path(path: &Path) -> anyhow::Result<Self> {
+        let parent = path.parent().map(Into::into).unwrap_or_default();
+        let stem = match path.file_stem() {
+            Some(index) if index == "index" => ContentSlugStem::Index,
+            Some(other) => ContentSlugStem::Other(other.into()),
+            None => bail!("Content at [{}] has no file name", path.display()),
+        };
+        let extension = path.extension().map(OsStr::to_owned);
+        Ok(Self {
+            parent,
+            stem,
+            extension,
+        })
+    }
+
+    fn as_path(&self) -> PathBuf {
+        let mut path = self.parent.join(match &self.stem {
+            ContentSlugStem::Index => OsStr::new("index"),
+            ContentSlugStem::Other(os_string) => os_string,
+        });
+        path.set_extension(self.extension.as_ref().cloned().unwrap_or_default());
+        path
+    }
+
+    fn make_subpage_range_start(&self) -> Self {
+        let parent = match &self.stem {
+            ContentSlugStem::Index => self.parent.clone(),
+            ContentSlugStem::Other(os_string) => self.parent.join(os_string),
+        };
+
+        Self {
+            parent,
+            stem: ContentSlugStem::Other("".into()),
+            extension: None,
+        }
+    }
+}
+
+impl PartialOrd for ContentSlug {
+    fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ContentSlug {
+    fn cmp(&self, other: &Self) -> cmp::Ordering {
+        self.parent
+            .cmp(&other.parent)
+            .reverse()
+            .then_with(|| self.stem.cmp(&other.stem))
+            .then_with(|| self.extension.cmp(&other.extension))
+    }
 }
 
 #[derive(Debug)]
+struct Content {
+    metadata: MetadataContainer,
+    files: BTreeMap<ContentSlug, ContentFile>,
+}
+
+#[derive(Debug, Clone)]
 enum MediaType {
     Other(Option<String>),
     Djot,
@@ -131,7 +230,7 @@ impl MediaType {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 enum Transform {
     ReadDjotFrontMatter,
     ReadDjotTitle,
@@ -139,42 +238,69 @@ enum Transform {
     ApplyTemplate,
 }
 
-#[derive(Debug, Default)]
-struct Metadata {
-    map: HashMap<TypeId, Box<dyn Any>>,
-}
-
-impl Metadata {
-    fn insert(&mut self, value: impl Any) -> bool {
-        let type_id = value.type_id();
-        self.map.insert(type_id, Box::new(value)).is_some()
-    }
-
-    fn remove<T: Any>(&mut self) -> Option<Box<T>> {
-        let Some(value) = self.map.remove(&TypeId::of::<T>()) else {
-            return None;
-        };
-
-        Some(
-            value
-                .downcast::<T>()
-                .expect("should have value of type `T`"),
-        )
-    }
-}
-
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 #[serde(transparent)]
 struct Frontmatter(tera::Value);
 
 #[derive(Debug, Serialize)]
-#[serde(transparent)]
-struct PageTitle(String);
+struct Metadata {
+    #[serde(flatten)]
+    frontmatter: Option<Frontmatter>,
+    title: Option<String>,
+    debug: bool,
+    url_path: PathBuf,
+    slug: ContentSlug,
+    is_article: bool,
+}
+
+impl Metadata {
+    fn new(args: &BuildCmd, slug: &ContentSlug, content_file: &ContentFile) -> Self {
+        Self {
+            frontmatter: Default::default(),
+            title: Default::default(),
+            debug: !args.release,
+            url_path: Path::new("/").join(slug.parent.join(content_file.output_filename())),
+            slug: slug.clone(),
+            is_article: content_file.is_article(),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct MetadataContainer(BTreeMap<ContentSlug, Metadata>);
+
+impl Index<&ContentSlug> for MetadataContainer {
+    type Output = Metadata;
+
+    fn index(&self, slug: &ContentSlug) -> &Self::Output {
+        self.0.get(slug).expect("content slug is present")
+    }
+}
+
+impl IndexMut<&ContentSlug> for MetadataContainer {
+    fn index_mut(&mut self, slug: &ContentSlug) -> &mut Self::Output {
+        self.0.get_mut(slug).expect("content slug is present")
+    }
+}
+
+impl MetadataContainer {
+    fn insert(&mut self, slug: ContentSlug, metadata: Metadata) {
+        let prev = self.0.insert(slug, metadata);
+        assert!(prev.is_none());
+    }
+
+    fn subpages(&self, slug: &ContentSlug) -> impl Iterator<Item = &Metadata> {
+        let start = slug.make_subpage_range_start();
+        let range = &start..slug;
+        debug!(?range, "Made subpages range");
+        self.0.range(range).map(|(_, md)| md)
+    }
+}
 
 #[derive(Debug)]
 struct ContentFile {
     input: BuildFile,
-    metadata: Metadata,
+    original_media_type: MediaType,
     current_media_type: MediaType,
     plan: Vec<Transform>,
 }
@@ -190,9 +316,9 @@ impl ContentFile {
 
         let mut file = Self {
             input,
+            original_media_type: current_media_type.clone(),
             current_media_type,
             plan: vec![],
-            metadata: Metadata::default(),
         };
 
         // Add steps to the plan based on various characteristics
@@ -212,34 +338,40 @@ impl ContentFile {
         file
     }
 
-    fn output_filename(&mut self) -> OsString {
+    fn output_filename(&self) -> OsString {
         let mut full_path = self.input.full_path.clone();
         full_path.set_extension(self.current_media_type.extension());
 
         full_path.file_name().unwrap_or_default().to_owned()
     }
 
-    #[instrument(skip_all, fields(slug = %content_slug.0.display()))]
+    fn is_article(&self) -> bool {
+        matches!(self.original_media_type, MediaType::Djot)
+    }
+
+    #[instrument(skip_all, fields(%slug))]
     fn process(
-        mut self,
+        &self,
         args: &BuildCmd,
         tera: &Tera,
         templates: &Templates,
-        content_slug: ContentSlug,
+        metadata: &mut MetadataContainer,
+        slug: &ContentSlug,
     ) -> anyhow::Result<()> {
-        let output_folder = self.create_output_parent(args, &content_slug)?;
+        let output_folder = self.create_output_parent(args, &slug)?;
         if self.plan.is_empty() {
             debug!("Plan is empty, copying file directly to output location");
             let output_path = output_folder.join(self.output_filename());
 
-            fs::copy(self.input.full_path, output_path).context("failed to copy file to output")?;
+            fs::copy(&self.input.full_path, output_path)
+                .context("failed to copy file to output")?;
             return Ok(());
         }
 
         let mut content =
             fs::read_to_string(&self.input.full_path).context("failed to read content file")?;
 
-        for step in self.plan.drain(..) {
+        for step in self.plan.iter().copied() {
             debug!(?step, "Applying step");
             match step {
                 Transform::ReadDjotFrontMatter => {
@@ -278,7 +410,7 @@ impl ContentFile {
 
                     debug!(?frontmatter, "Parsed frontmatter from djot file");
 
-                    self.metadata.insert(frontmatter);
+                    metadata[slug].frontmatter = Some(frontmatter);
 
                     // We can remove the frontmatter from the content at this
                     // point
@@ -316,17 +448,16 @@ impl ContentFile {
                         continue;
                     };
 
-                    self.metadata.insert(PageTitle(title));
+                    metadata[slug].title = Some(title);
                 },
                 Transform::DjotToHtml => {
                     let parser = jotdown::Parser::new(&content);
                     content = jotdown::html::render_to_string(parser);
                 },
                 Transform::ApplyTemplate => {
-                    let Some(template) =
-                        templates.find_template(&content_slug, &self.current_media_type)
+                    let Some(template) = templates.find_template(&slug, &self.current_media_type)
                     else {
-                        debug!(content_slug = %content_slug.0.display(), "Did not find template for content");
+                        debug!(%slug, "Did not find template for content");
                         continue;
                     };
 
@@ -335,17 +466,11 @@ impl ContentFile {
                         .strip_prefix(args.template_dir())
                         .unwrap();
                     debug!(template = %template_path.display(), "Rendering with template");
-                    let metadata = self
-                        .metadata
-                        .remove::<Frontmatter>()
-                        .map(|f| *f)
-                        .unwrap_or_default();
-                    let title = self.metadata.remove::<PageTitle>().map(|f| *f);
-                    let context = PageContext {
+                    let subpages = metadata.subpages(slug).collect();
+                    let context = TemplateContext {
                         content,
-                        metadata,
-                        title,
-                        debug: !args.release,
+                        metadata: &metadata[slug],
+                        subpages,
                     };
                     let tera_context = tera::Context::from_serialize(&context)
                         .context("failed to create tera context")?;
@@ -370,13 +495,21 @@ impl ContentFile {
         args: &BuildCmd,
         content_slug: &ContentSlug,
     ) -> anyhow::Result<PathBuf> {
-        let output_folder = args.output_folder(&content_slug);
+        let output_folder = args.output_folder(content_slug);
 
         fs::create_dir_all(&output_folder)
             .context("failed to create parent directory for output")?;
 
         Ok(output_folder)
     }
+}
+
+#[derive(Debug, Serialize)]
+struct TemplateContext<'a> {
+    content: String,
+    #[serde(flatten)]
+    metadata: &'a Metadata,
+    subpages: Vec<&'a Metadata>,
 }
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -399,13 +532,15 @@ impl Templates {
         Ok(tera)
     }
 
-    fn find_template(&self, path: &ContentSlug, media_type: &MediaType) -> Option<&BuildFile> {
-        if let Some(file) = self.files.get(&TemplateSlug(path.0.clone())) {
+    fn find_template(&self, slug: &ContentSlug, media_type: &MediaType) -> Option<&BuildFile> {
+        let mut slug_path = slug.as_path();
+        slug_path.set_extension(media_type.extension());
+        if let Some(file) = self.files.get(&TemplateSlug(slug_path)) {
             return Some(file);
         }
 
         let extension = media_type.extension();
-        let mut current_dir = path.0.parent();
+        let mut current_dir = Some(slug.parent.as_path());
         loop {
             let dir = current_dir.unwrap_or_else(|| Path::new(""));
 
@@ -433,7 +568,8 @@ struct Site {
 }
 
 impl Site {
-    fn parse(build_files: BuildDirFiles) -> anyhow::Result<Self> {
+    fn parse(args: &BuildCmd, build_files: BuildDirFiles) -> anyhow::Result<Self> {
+        let mut metadata_container = MetadataContainer::default();
         let mut content_files = BTreeMap::new();
         let mut templates_files = BTreeMap::new();
 
@@ -449,8 +585,12 @@ impl Site {
                         )
                     }
 
-                    let sub_path = path.strip_prefix("content")?.to_path_buf();
-                    content_files.insert(ContentSlug(sub_path), ContentFile::from_input(file));
+                    let sub_path = path.strip_prefix("content")?;
+                    let slug = ContentSlug::from_path(sub_path)?;
+                    let content_file = ContentFile::from_input(file);
+                    let metadata = Metadata::new(args, &slug, &content_file);
+                    metadata_container.insert(slug.clone(), metadata);
+                    content_files.insert(slug, content_file);
                 } else if first_component.as_os_str() == "templates" {
                     if path.extension().map(|ext| ext != "html").unwrap_or(true) {
                         bail!(
@@ -470,6 +610,7 @@ impl Site {
 
         Ok(Site {
             content: Content {
+                metadata: metadata_container,
                 files: content_files,
             },
             templates: Templates {
@@ -501,14 +642,6 @@ impl Site {
 
         Ok(())
     }
-}
-
-#[derive(Debug, Serialize)]
-struct PageContext {
-    content: String,
-    metadata: Frontmatter,
-    title: Option<PageTitle>,
-    debug: bool,
 }
 
 #[tracing::instrument(skip_all)]
@@ -554,8 +687,8 @@ pub fn build(args: BuildCmd) -> anyhow::Result<()> {
     //  5. Files all folder are copied (after processing) to the output directory
     //     while maintaining their relative directory structure
 
-    let site =
-        Site::parse(build_files).context("failed to parse site structure from input files")?;
+    let mut site = Site::parse(&args, build_files)
+        .context("failed to parse site structure from input files")?;
 
     debug!(?site, "Separated input files into distinct categories");
 
@@ -583,13 +716,19 @@ pub fn build(args: BuildCmd) -> anyhow::Result<()> {
     }
 
     // Process content files
-    for (slug, file) in site.content.files {
+    for (slug, file) in &mut site.content.files {
         let ctx = format!(
             "Failed to process file [{}] into output",
             file.input.full_path.display()
         );
-        file.process(&args, &tera, &site.templates, slug)
-            .context(ctx)?;
+        file.process(
+            &args,
+            &tera,
+            &site.templates,
+            &mut site.content.metadata,
+            slug,
+        )
+        .context(ctx)?;
     }
 
     Site::format_output(&args)?;

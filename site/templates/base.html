@@ -28,21 +28,35 @@
     {% endblock head %}
 </head>
 
-<body>
+<body {% if draft %} class="draft" {% endif %}>
     <header>
-        <nav>
-            
+        <nav aria-label="Main" class="horizontal-nav">
+            <ul>
+                <li><a href="/"><img id="nav-logo" src="/favicon/favicon.svg"></a></li>
+                <li><a href="/">Home</a></li>
+                <li><a href="/blog/">Blog</a></li>
+                <li><a href="/projects/">Projects</a></li>
+            </ul>
         </nav>
         {% block header %}{% endblock header %}
     </header>
-    <main {% if metadata.draft %} class="draft" {% endif %}>
+    <main>
         {% block main %}{% endblock main %}
     </main>
     <footer>
         {% block footer %}
-        <a rel="license" href="http://creativecommons.org/licenses/by-sa/4.0/">
-            <img alt="Creative Commons License" style="border-width:0" src="https://licensebuttons.net/l/by-sa/4.0/88x31.png">
-        </a>
+        <hr>
+        <div class="footer-bar">
+            <a rel="license" href="http://creativecommons.org/licenses/by-sa/4.0/" target="_blank">
+                <img alt="Creative Commons License" style="border-width:0" src="https://licensebuttons.net/l/by-sa/4.0/88x31.png">
+            </a>
+            <nav aria-label="Footer" class="horizontal-nav">
+                <ul>
+                    <li><a href="/rss.xml">Feed</a></li>
+                    <li><a href="mailto:dkelly.home@gmail.com">Contact</a></li>
+                </ul>
+            </nav>
+        </div>
         {% endblock footer %}
         {% if debug %}
         <section class="debug">
