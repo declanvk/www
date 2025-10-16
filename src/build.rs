@@ -5,7 +5,7 @@ use std::{
     fmt,
     fs::{self, DirEntry},
     io,
-    ops::{Index, IndexMut},
+    ops::{Index, IndexMut, Range},
     path::{Path, PathBuf},
     process::Command,
 };
@@ -177,16 +177,33 @@ impl ContentSlug {
         path
     }
 
-    fn make_subpage_range_start(&self) -> Self {
-        let parent = match &self.stem {
-            ContentSlugStem::Index => self.parent.clone(),
-            ContentSlugStem::Other(os_string) => self.parent.join(os_string),
-        };
+    fn make_subpage_range(&self) -> Range<Self> {
+        match &self.stem {
+            ContentSlugStem::Index => {
+                let start = Self {
+                    parent: self.parent.clone(),
+                    stem: ContentSlugStem::Other("".into()),
+                    extension: None,
+                };
 
-        Self {
-            parent,
-            stem: ContentSlugStem::Other("".into()),
-            extension: None,
+                start..(self.clone())
+            },
+            ContentSlugStem::Other(os_string) => {
+                let parent = self.parent.join(os_string);
+                let start = Self {
+                    parent: parent.clone(),
+                    stem: ContentSlugStem::Other("".into()),
+                    extension: None,
+                };
+
+                let end = Self {
+                    parent,
+                    stem: ContentSlugStem::Index,
+                    extension: None,
+                };
+
+                start..end
+            },
         }
     }
 }
@@ -289,11 +306,15 @@ impl MetadataContainer {
         assert!(prev.is_none());
     }
 
-    fn subpages(&self, slug: &ContentSlug) -> impl Iterator<Item = &Metadata> {
-        let start = slug.make_subpage_range_start();
-        let range = &start..slug;
-        debug!(?range, "Made subpages range");
-        self.0.range(range).map(|(_, md)| md)
+    fn subpages(&self, slug: &ContentSlug) -> Vec<&Metadata> {
+        let range = slug.make_subpage_range();
+        let subpages = self
+            .0
+            .range(range.clone())
+            .map(|(_, md)| md)
+            .collect::<Vec<_>>();
+        debug!(?range, ?subpages, "Collected subpages");
+        subpages
     }
 }
 
@@ -466,11 +487,12 @@ impl ContentFile {
                         .strip_prefix(args.template_dir())
                         .unwrap();
                     debug!(template = %template_path.display(), "Rendering with template");
-                    let subpages = metadata.subpages(slug).collect();
+                    let subpages = metadata.subpages(slug);
                     let context = TemplateContext {
                         content,
                         metadata: &metadata[slug],
                         subpages,
+                        release: args.release,
                     };
                     let tera_context = tera::Context::from_serialize(&context)
                         .context("failed to create tera context")?;
@@ -510,6 +532,7 @@ struct TemplateContext<'a> {
     #[serde(flatten)]
     metadata: &'a Metadata,
     subpages: Vec<&'a Metadata>,
+    release: bool,
 }
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
