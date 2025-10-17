@@ -12,10 +12,11 @@ use std::{
 
 use anyhow::{Context, bail};
 use argh::FromArgs;
-use jotdown::{self, Container, Event};
 use serde::{Deserialize, Serialize};
 use tera::Tera;
 use tracing::{debug, instrument};
+
+mod djot;
 
 /// Build the static site.
 #[derive(FromArgs, Debug)]
@@ -132,7 +133,7 @@ impl PartialOrd for ContentSlugStem {
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 struct ContentSlug {
-    parent: PathBuf,
+    pub parent: PathBuf,
     stem: ContentSlugStem,
     extension: Option<OsString>,
 }
@@ -249,9 +250,7 @@ impl MediaType {
 
 #[derive(Debug, Clone, Copy)]
 enum Transform {
-    ReadDjotFrontMatter,
-    ReadDjotTitle,
-    DjotToHtml,
+    RenderDjot,
     ApplyTemplate,
 }
 
@@ -268,17 +267,19 @@ struct Metadata {
     url_path: PathBuf,
     slug: ContentSlug,
     is_article: bool,
+    bibliography_file: Option<String>,
 }
 
 impl Metadata {
     fn new(args: &BuildCmd, slug: &ContentSlug, content_file: &ContentFile) -> Self {
         Self {
-            frontmatter: Default::default(),
-            title: Default::default(),
+            frontmatter: None,
+            title: None,
             debug: !args.release,
             url_path: Path::new("/").join(slug.parent.join(content_file.output_filename())),
             slug: slug.clone(),
             is_article: content_file.is_article(),
+            bibliography_file: None,
         }
     }
 }
@@ -346,9 +347,7 @@ impl ContentFile {
         // The order here is also very important
 
         if matches!(file.current_media_type, MediaType::Djot) {
-            file.plan.push(Transform::ReadDjotFrontMatter);
-            file.plan.push(Transform::ReadDjotTitle);
-            file.plan.push(Transform::DjotToHtml);
+            file.plan.push(Transform::RenderDjot);
             file.current_media_type = MediaType::Html;
         }
 
@@ -379,7 +378,7 @@ impl ContentFile {
         metadata: &mut MetadataContainer,
         slug: &ContentSlug,
     ) -> anyhow::Result<()> {
-        let output_folder = self.create_output_parent(args, &slug)?;
+        let output_folder = self.create_output_parent(args, slug)?;
         if self.plan.is_empty() {
             debug!("Plan is empty, copying file directly to output location");
             let output_path = output_folder.join(self.output_filename());
@@ -395,88 +394,12 @@ impl ContentFile {
         for step in self.plan.iter().copied() {
             debug!(?step, "Applying step");
             match step {
-                Transform::ReadDjotFrontMatter => {
-                    let mut events = jotdown::Parser::new(&content).into_offset_iter();
-
-                    let Some((Event::Start(Container::RawBlock { format: "json" }, _), _)) =
-                        events.next()
-                    else {
-                        debug!("Missing json raw block start, skipping frontmatter");
-                        continue;
-                    };
-
-                    // We know at this point that we're in a raw json block, so we'll expect the
-                    // next event(s) to be `Str`
-                    let mut frontmatter = String::new();
-                    let next_event = loop {
-                        let next = events.next();
-                        match next {
-                            Some((Event::Str(fragment), _)) => {
-                                frontmatter.push_str(&fragment);
-                            },
-                            Some(_) | None => break next,
-                        }
-                    };
-
-                    // Also need the block to terminate
-                    let Some((Event::End(Container::RawBlock { format: "json" }), end_span)) =
-                        next_event
-                    else {
-                        debug!("Missing raw block ending, skipping frontmatter");
-                        continue;
-                    };
-
-                    let frontmatter: Frontmatter = serde_json::from_str(&frontmatter)
-                        .context("failed to parse frontmatter")?;
-
-                    debug!(?frontmatter, "Parsed frontmatter from djot file");
-
-                    metadata[slug].frontmatter = Some(frontmatter);
-
-                    // We can remove the frontmatter from the content at this
-                    // point
-                    let remainder = content.split_off(end_span.end);
-                    content = remainder;
-                },
-                Transform::ReadDjotTitle => {
-                    let mut events = jotdown::Parser::new(&content).skip_while(|e| {
-                        !matches!(e, Event::Start(Container::Heading { level: 1, .. }, _))
-                    });
-
-                    let Some(Event::Start(Container::Heading { level: 1, .. }, _)) = events.next()
-                    else {
-                        debug!("Missing page title start, skipping");
-                        continue;
-                    };
-
-                    // We know at this point that we're in a raw json block, so we'll expect the
-                    // next event(s) to be `Str`
-                    let mut title = String::new();
-                    let next_event = loop {
-                        let next = events.next();
-                        match next {
-                            Some(Event::Str(fragment)) => {
-                                title.push_str(&fragment);
-                            },
-                            Some(Event::Softbreak) => continue,
-                            Some(_) | None => break next,
-                        }
-                    };
-
-                    // Also need the block to terminate
-                    let Some(Event::End(Container::Heading { level: 1, .. })) = next_event else {
-                        debug!("Missing page title end, skipping");
-                        continue;
-                    };
-
-                    metadata[slug].title = Some(title);
-                },
-                Transform::DjotToHtml => {
-                    let parser = jotdown::Parser::new(&content);
-                    content = jotdown::html::render_to_string(parser);
+                Transform::RenderDjot => {
+                    content = djot::render(&self.input, metadata, slug, &content)
+                        .context("parsing djot content to HTML")?;
                 },
                 Transform::ApplyTemplate => {
-                    let Some(template) = templates.find_template(&slug, &self.current_media_type)
+                    let Some(template) = templates.find_template(slug, &self.current_media_type)
                     else {
                         debug!(%slug, "Did not find template for content");
                         continue;
